@@ -28,6 +28,7 @@ and file inclusion
 by verifying compressed proofs without converting them to normal proof format;
 added type hints
 (am 29-May-2023) added typeguards
+(am 23-Dec-2023) made code pass pylint and types pass mypy
 """
 
 import sys
@@ -47,7 +48,15 @@ Stmt = list[Symbol]
 Ehyp = Stmt
 Fhyp = tuple[Var, Const]
 Dv = tuple[Var, Var]
-Assertion = tuple[set[Dv], list[Fhyp], list[Ehyp], Stmt]
+class Assertion(typing.NamedTuple):
+    """A quadruple (disjoint variable conditions, floating
+    hypotheses, essential hypotheses, conclusion) describing the given
+    assertion.
+    """
+    dvs: set[Dv]
+    f_hyps: list[Fhyp]
+    e_hyps: list[Ehyp]
+    stmt: Stmt
 FullStmt = tuple[Stmttype, typing.Union[Stmt, Assertion]]
 
 def is_hypothesis(stmt: FullStmt) -> typing.TypeGuard[tuple[Stmttype, Stmt]]:
@@ -70,12 +79,10 @@ def is_assertion(stmt: FullStmt) -> typing.TypeGuard[tuple[Stmttype, Assertion]]
 
 class MMError(Exception):
     """Class of Metamath errors."""
-    pass
 
 
 class MMKeyError(MMError, KeyError):
     """Class of Metamath key errors."""
-    pass
 
 
 def vprint(vlevel: int, *arguments: typing.Any) -> None:
@@ -134,8 +141,8 @@ class Toks:
             endbracket = self.read()
             if endbracket != '$]':
                 raise MMError(
-                    ("Inclusion statement for file {} not " +
-                     "closed with a '$]'.").format(filename))
+                    f"Inclusion statement for file {filename} not " +
+                    "closed with a '$]'.")
             file = pathlib.Path(filename).resolve()
             if file not in self.imported_files:
                 # wrap the rest of the line after the inclusion command in a
@@ -146,7 +153,8 @@ class Toks:
                             reversed(
                                 self.tokbuf))))
                 self.tokbuf = []
-                self.files_buf.append(open(file, mode='r', encoding='ascii'))
+                with open(file, mode='r', encoding='ascii') as cursor:
+                    self.files_buf.append(cursor)
                 self.imported_files.add(file)
                 vprint(5, 'Importing file:', filename)
             tok = self.read()
@@ -168,10 +176,10 @@ class Toks:
             while tok and tok != '$)':
                 if '$(' in tok or '$)' in tok:
                     raise MMError(
-                        ("Encountered token '{}' while reading a comment. " +
-                         "Comment contents should not contain '$(' nor " +
-                         "'$)' as a substring.  In particular, comments " +
-                         "should not nest.").format(tok))
+                        f"Encountered token '{tok}' while reading a comment. " +
+                        "Comment contents should not contain '$(' nor " +
+                        "'$)' as a substring.  In particular, comments " +
+                        "should not nest.")
                 tok = self.read()
             if not tok:
                 raise MMError("Unclosed comment at end of file.")
@@ -187,16 +195,27 @@ class Frame:
 
     def __init__(self) -> None:
         """Construct an empty frame."""
-        self.v: set[Var] = set()
-        self.d: set[Dv] = set()
-        self.f: list[Fhyp] = []
+        self.var: set[Var] = set()
+        self.disjoint: set[Dv] = set()
+        self.floating: list[Fhyp] = []
         self.f_labels: dict[Var, Label] = {}
-        self.e: list[Ehyp] = []
+        self.essential: list[Ehyp] = []
         self.e_labels: dict[tuple[Symbol, ...], Label] = {}
-        # Note: both self.e and self.e_labels are needed since the keys of
-        # self.e_labels form a set, but the order and repetitions of self.e
+        # Note: both self.essential and self.e_labels are needed since the keys of
+        # self.e_labels form a set, but the order and repetitions of self.essential
         # are needed.
 
+    def add_e(self, stmt: Stmt, label: Label) -> None:
+        """Add an essential hypothesis (token tuple)."""
+        self.essential.append(stmt)
+        self.e_labels[tuple(stmt)] = label
+        # conversion to tuple since dictionary keys must be hashable
+
+    def add_d(self, varlist: list[Var]) -> None:
+        """Add a disjoint variable condition (ordered pair of variables)."""
+        self.disjoint.update((min(x, y), max(x, y))
+                          for x, y in itertools.product(varlist, varlist)
+                          if x != y)
 
 class FrameStack(list[Frame]):
     """Class of frame stacks, which extends lists (considered and used as
@@ -211,28 +230,23 @@ class FrameStack(list[Frame]):
         """Add an essential hypothesis (token tuple) to the frame stack
         top.
         """
-        frame = self[-1]
-        frame.e.append(stmt)
-        frame.e_labels[tuple(stmt)] = label
-        # conversion to tuple since dictionary keys must be hashable
+        self[-1].add_e(stmt, label)
 
     def add_d(self, varlist: list[Var]) -> None:
         """Add a disjoint variable condition (ordered pair of variables) to
         the frame stack top.
         """
-        self[-1].d.update((min(x, y), max(x, y))
-                          for x, y in itertools.product(varlist, varlist)
-                          if x != y)
+        self[-1].add_d(varlist)
 
     def lookup_v(self, tok: Var) -> bool:
         """Return whether the given token is an active variable."""
-        return any(tok in fr.v for fr in self)
+        return any(tok in fr.var for fr in self)
 
-    def lookup_d(self, x: Var, y: Var) -> bool:
+    def lookup_d(self, x_var: Var, y_var: Var) -> bool:
         """Return whether the given ordered pair of tokens belongs to an
         active disjoint variable statement.
         """
-        return any((min(x, y), max(x, y)) in fr.d for fr in self)
+        return any((min(x_var, y_var), max(x_var, y_var)) in fr.disjoint for fr in self)
 
     def lookup_f(self, var: Var) -> typing.Optional[Label]:
         """Return the label of the active floating hypothesis which types the
@@ -266,18 +280,18 @@ class FrameStack(list[Frame]):
         hypotheses, essential hypotheses, conclusion) describing the given
         assertion.
         """
-        e_hyps = [eh for fr in self for eh in fr.e]
+        e_hyps = [eh for fr in self for eh in fr.essential]
         mand_vars = {tok for hyp in itertools.chain(e_hyps, [stmt])
                      for tok in hyp if self.lookup_v(tok)}
         dvs = {(x, y) for fr in self for (x, y)
-               in fr.d if x in mand_vars and y in mand_vars}
+               in fr.disjoint if x in mand_vars and y in mand_vars}
         f_hyps = []
-        for fr in self:
-            for typecode, var in fr.f:
+        for frame in self:
+            for typecode, var in frame.floating:
                 if var in mand_vars:
                     f_hyps.append((typecode, var))
                     mand_vars.remove(var)
-        assertion = dvs, f_hyps, e_hyps, stmt
+        assertion = Assertion(dvs, f_hyps, e_hyps, stmt)
         vprint(18, 'Make assertion:', assertion)
         return assertion
 
@@ -302,7 +316,7 @@ class MM:
     def __init__(self, begin_label: Label, stop_label: Label) -> None:
         """Construct an empty Metamath database."""
         self.constants: set[Const] = set()
-        self.fs = FrameStack()
+        self.framestack = FrameStack()
         self.labels: dict[Label, FullStmt] = {}
         self.begin_label = begin_label
         self.stop_label = stop_label
@@ -312,37 +326,37 @@ class MM:
         """Add a constant to the database."""
         if tok in self.constants:
             raise MMError(
-                'Constant already declared: {}'.format(tok))
-        if self.fs.lookup_v(tok):
+                f'Constant already declared: {tok}')
+        if self.framestack.lookup_v(tok):
             raise MMError(
-                'Trying to declare as a constant an active variable: {}'.format(tok))
+                f'Trying to declare as a constant an active variable: {tok}')
         self.constants.add(tok)
 
     def add_v(self, tok: Var) -> None:
         """Add a variable to the frame stack top (that is, the current frame)
         of the database.  Allow local variable declarations.
         """
-        if self.fs.lookup_v(tok):
-            raise MMError('var already declared and active: {}'.format(tok))
+        if self.framestack.lookup_v(tok):
+            raise MMError(f'var already declared and active: {tok}')
         if tok in self.constants:
             raise MMError(
-                'var already declared as constant: {}'.format(tok))
-        self.fs[-1].v.add(tok)
+                f'var already declared as constant: {tok}')
+        self.framestack[-1].var.add(tok)
 
     def add_f(self, typecode: Const, var: Var, label: Label) -> None:
         """Add a floating hypothesis (ordered pair (variable, typecode)) to
         the frame stack top (that is, the current frame) of the database.
         """
-        if not self.fs.lookup_v(var):
-            raise MMError('var in $f not declared: {}'.format(var))
+        if not self.framestack.lookup_v(var):
+            raise MMError(f'var in $f not declared: {var}')
         if typecode not in self.constants:
-            raise MMError('typecode in $f not declared: {}'.format(typecode))
-        if any(var in fr.f_labels for fr in self.fs):
+            raise MMError(f'typecode in $f not declared: {typecode}')
+        if any(var in fr.f_labels for fr in self.framestack):
             raise MMError(
-                ("var in $f already typed by an active " +
-                 "$f-statement: {}").format(var))
-        frame = self.fs[-1]
-        frame.f.append((typecode, var))
+                "var in $f already typed by an active " +
+                f"$f-statement: {var}")
+        frame = self.framestack[-1]
+        frame.floating.append((typecode, var))
         frame.f_labels[var] = label
 
     def readstmt_aux(
@@ -357,22 +371,22 @@ class MM:
         stmt = []
         tok = toks.readc()
         while tok and tok != end_token:
-            is_active_var = self.fs.lookup_v(tok)
+            is_active_var = self.framestack.lookup_v(tok)
             if stmttype in {'$d', '$e', '$a', '$p'} and not (
                     tok in self.constants or is_active_var):
                 raise MMError(
-                    "Token {} is not an active symbol".format(tok))
+                    f"Token {tok} is not an active symbol")
             if stmttype in {
                 '$e',
                 '$a',
-                    '$p'} and is_active_var and not self.fs.lookup_f(tok):
-                raise MMError(("Variable {} in {}-statement is not typed " +
-                               "by an active $f-statement).").format(tok, stmttype))
+                    '$p'} and is_active_var and not self.framestack.lookup_f(tok):
+                raise MMError(f"Variable {tok} in {stmttype}-statement is not typed " +
+                              "by an active $f-statement).")
             stmt.append(tok)
             tok = toks.readc()
         if not tok:
             raise MMError(
-                "Unclosed {}-statement at end of file.".format(stmttype))
+                f"Unclosed {stmttype}-statement at end of file.")
         assert tok == end_token
         vprint(20, 'Statement:', stmt)
         return stmt
@@ -393,75 +407,99 @@ class MM:
         proof = self.readstmt_aux("$=", toks, end_token="$.")
         return stmt, proof
 
+    def read_cvfe(self, tok: str, toks: Toks, label):
+        """Read constant, variable, floating hypothesis, or essential
+        hypothesis from the given token list to update the database and
+        verify its proofs.
+        """
+        match tok:
+            case '$c':
+                for tok_c in self.read_non_p_stmt('$c', toks):
+                    self.add_c(tok_c)
+            case '$v':
+                for tok_v in self.read_non_p_stmt('$v', toks):
+                    self.add_v(tok_v)
+            case '$f':
+                stmt = self.read_non_p_stmt('$f', toks)
+                if not label:
+                    raise MMError(
+                        f'$f must have label (statement: {stmt})')
+                if len(stmt) != 2:
+                    raise MMError(
+                        f'$f must have length two but is {stmt}')
+                self.add_f(stmt[0], stmt[1], label)
+                self.labels[label] = ('$f', [stmt[0], stmt[1]])
+                label = None
+            case '$e':
+                if not label:
+                    raise MMError('$e must have label')
+                stmt = self.read_non_p_stmt('$e', toks)
+                self.framestack.add_e(stmt, label)
+                self.labels[label] = ('$e', stmt)
+                label = None
+
+    def read_stmt_or_proof(self, tok: str, toks: Toks, label):
+        """Read constant, variable, floating hypothesis, essential
+        hypothesis, assertion, or disjoint variable condition from the
+        given token list to update the database and verify its proofs.
+        """
+        match tok:
+            case '$c' | '$v' | '$f' | '$e':
+                self.read_cvfe(tok, toks, label)
+            case '$a':
+                if not label:
+                    raise MMError('$a must have label')
+                self.labels[label] = (
+                    '$a', self.framestack.make_assertion(
+                        self.read_non_p_stmt('$a', toks)))
+                label = None
+            case '$p':
+                if not label:
+                    raise MMError('$p must have label')
+                stmt, proof = self.read_p_stmt(toks)
+                assertion = self.framestack.make_assertion(stmt)
+                if self.verify_proofs:
+                    vprint(2, 'Verify:', label)
+                    self.verify(assertion.f_hyps, assertion.e_hyps, assertion.stmt, proof)
+                self.labels[label] = ('$p', assertion)
+                label = None
+            case '$d':
+                self.framestack.add_d(self.read_non_p_stmt('$d', toks))
+
     def read(self, toks: Toks) -> None:
         """Read the given token list to update the database and verify its
         proofs.
         """
-        self.fs.push()
+        self.framestack.push()
         label = None
         tok = toks.readc()
-        while tok and tok != '$}':
-            if tok == '$c':
-                for tok in self.read_non_p_stmt(tok, toks):
-                    self.add_c(tok)
-            elif tok == '$v':
-                for tok in self.read_non_p_stmt(tok, toks):
-                    self.add_v(tok)
-            elif tok == '$f':
-                stmt = self.read_non_p_stmt(tok, toks)
-                if not label:
-                    raise MMError(
-                        '$f must have label (statement: {})'.format(stmt))
-                if len(stmt) != 2:
-                    raise MMError(
-                        '$f must have length two but is {}'.format(stmt))
-                self.add_f(stmt[0], stmt[1], label)
-                self.labels[label] = ('$f', [stmt[0], stmt[1]])
-                label = None
-            elif tok == '$e':
-                if not label:
-                    raise MMError('$e must have label')
-                stmt = self.read_non_p_stmt(tok, toks)
-                self.fs.add_e(stmt, label)
-                self.labels[label] = ('$e', stmt)
-                label = None
-            elif tok == '$a':
-                if not label:
-                    raise MMError('$a must have label')
-                self.labels[label] = (
-                    '$a', self.fs.make_assertion(
-                        self.read_non_p_stmt(tok, toks)))
-                label = None
-            elif tok == '$p':
-                if not label:
-                    raise MMError('$p must have label')
-                stmt, proof = self.read_p_stmt(toks)
-                dvs, f_hyps, e_hyps, conclusion = self.fs.make_assertion(stmt)
-                if self.verify_proofs:
-                    vprint(2, 'Verify:', label)
-                    self.verify(f_hyps, e_hyps, conclusion, proof)
-                self.labels[label] = ('$p', (dvs, f_hyps, e_hyps, conclusion))
-                label = None
-            elif tok == '$d':
-                self.fs.add_d(self.read_non_p_stmt(tok, toks))
-            elif tok == '${':
-                self.read(toks)
-            elif tok == '$)':
-                raise MMError("Unexpected '$)' while not within a comment")
-            elif tok[0] != '$':
-                if tok in self.labels:
-                    raise MMError("Label {} multiply defined.".format(tok))
-                label = tok
-                vprint(20, 'Label:', label)
-                if label == self.stop_label:
-                    # TODO: exit gracefully the nested calls to self.read()
-                    sys.exit(0)
-                if label == self.begin_label:
-                    self.verify_proofs = True
-            else:
-                raise MMError("Unknown token: '{}'.".format(tok))
-            tok = toks.readc()
-        self.fs.pop()
+        try:
+            while tok and tok != '$}':
+                match tok:
+                    case '$c' | '$v' | '$f' | '$e' | '$a' | '$p' | '$d':
+                        self.read_stmt_or_proof(tok, toks, label)
+                    case '${':
+                        self.read(toks)
+                    case '$)':
+                        raise MMError("Unexpected '$)' while not within a comment")
+                    case _:
+                        if tok[0] != '$':
+                            if tok in self.labels:
+                                raise MMError(f'Label {tok} multiply defined.')
+                            label = tok
+                            vprint(20, 'Label:', label)
+                            if label == self.stop_label:
+                                # exit gracefully the nested calls to self.read()
+                                sys.exit(0)
+                            if label == self.begin_label:
+                                self.verify_proofs = True
+                        else:
+                            raise MMError(f"Unknown token: '{tok}'.")
+                tok = toks.readc()
+        except SystemExit as exit_err:
+            raise exit_err
+        finally:
+            self.framestack.pop()
 
     def treat_step(self,
                    step: FullStmt,
@@ -471,50 +509,52 @@ class MM:
         """
         vprint(10, 'Proof step:', step)
         if is_hypothesis(step):
-            _steptype, stmt = step
+            stmt = step[1]
             stack.append(stmt)
         elif is_assertion(step):
-            _steptype, assertion = step
-            dvs0, f_hyps0, e_hyps0, conclusion0 = assertion
-            npop = len(f_hyps0) + len(e_hyps0)
-            sp = len(stack) - npop
-            if sp < 0:
+            assertion = step[1]
+            npop = len(assertion.f_hyps) + len(assertion.e_hyps)
+            stackpointer = len(stack) - npop
+            if stackpointer < 0:
                 raise MMError(
-                    ("Stack underflow: proof step {} requires too many " +
-                     "({}) hypotheses.").format(
-                        step,
-                        npop))
+                    f"Stack underflow: proof step {step} requires too many " +
+                    f"({npop}) hypotheses.")
             subst: dict[Var, Stmt] = {}
-            for typecode, var in f_hyps0:
-                entry = stack[sp]
+            for typecode, var in assertion.f_hyps:
+                entry = stack[stackpointer]
                 if entry[0] != typecode:
                     raise MMError(
-                        ("Proof stack entry {} does not match floating " +
-                         "hypothesis ({}, {}).").format(entry, typecode, var))
+                        f"Proof stack entry {entry} does not match floating " +
+                        f"hypothesis ({typecode}, {var}).")
                 subst[var] = entry[1:]
-                sp += 1
+                stackpointer += 1
             vprint(15, 'Substitution to apply:', subst)
-            for h in e_hyps0:
-                entry = stack[sp]
-                subst_h = apply_subst(h, subst)
+            for hyp in assertion.e_hyps:
+                entry = stack[stackpointer]
+                subst_h = apply_subst(hyp, subst)
                 if entry != subst_h:
-                    raise MMError(("Proof stack entry {} does not match " +
-                                   "essential hypothesis {}.")
-                                  .format(entry, subst_h))
-                sp += 1
-            for x, y in dvs0:
-                vprint(16, 'dist', x, y, subst[x], subst[y])
-                x_vars = self.fs.find_vars(subst[x])
-                y_vars = self.fs.find_vars(subst[y])
-                vprint(16, 'V(x) =', x_vars)
-                vprint(16, 'V(y) =', y_vars)
-                for x0, y0 in itertools.product(x_vars, y_vars):
-                    if x0 == y0 or not self.fs.lookup_d(x0, y0):
-                        raise MMError("Disjoint variable violation: " +
-                                      "{} , {}".format(x0, y0))
+                    raise MMError(f"Proof stack entry {entry} does not match " +
+                                  f"essential hypothesis {subst_h}.")
+                stackpointer += 1
+            self.treat_disjoint_conditions(assertion.dvs, subst)
             del stack[len(stack) - npop:]
-            stack.append(apply_subst(conclusion0, subst))
+            stack.append(apply_subst(assertion.stmt, subst))
         vprint(12, 'Proof stack:', stack)
+
+    def treat_disjoint_conditions(self, dvs, subst) -> None:
+        """Carry out the given disjoint variable conditions (given the
+        substitution to apply).
+        """
+        for x_var, y_var in dvs:
+            vprint(16, 'dist', x_var, y_var, subst[x_var], subst[y_var])
+            x_vars = self.framestack.find_vars(subst[x_var])
+            y_vars = self.framestack.find_vars(subst[y_var])
+            vprint(16, 'V(x_var) =', x_vars)
+            vprint(16, 'V(y_var) =', y_vars)
+            for x_var0, y_var0 in itertools.product(x_vars, y_vars):
+                if x_var0 == y_var0 or not self.framestack.lookup_d(x_var0, y_var0):
+                    raise MMError("Disjoint variable violation: " +
+                                  f"{x_var0} , {y_var0}")
 
     def treat_normal_proof(self, proof: list[str]) -> list[Stmt]:
         """Return the proof stack once the given normal proof has been
@@ -534,8 +574,8 @@ class MM:
         assertion with the given $f and $e-hypotheses has been processed.
         """
         # Preprocessing and building the lists of proof_ints and labels
-        flabels = [self.fs.lookup_f(v) for _, v in f_hyps]
-        elabels = [self.fs.lookup_e(s) for s in e_hyps]
+        flabels = [self.framestack.lookup_f(v) for _, v in f_hyps]
+        elabels = [self.framestack.lookup_e(s) for s in e_hyps]
         plabels = flabels + elabels  # labels of implicit hypotheses
         idx_bloc = proof.index(')')  # index of end of label bloc
         plabels += proof[1:idx_bloc]  # labels which will be referenced later
@@ -547,16 +587,20 @@ class MM:
         vprint(5, 'Number of steps:', len(compressed_proof))
         proof_ints = []  # integers referencing the labels in 'labels'
         cur_int = 0  # counter for radix conversion
-        for ch in compressed_proof:
-            if ch == 'Z':
+        for character in compressed_proof:
+            if character == 'Z':
                 proof_ints.append(-1)
-            elif 'A' <= ch <= 'T':
-                proof_ints.append(20 * cur_int + ord(ch) - 65)  # ord('A') = 65
+            elif 'A' <= character <= 'T':
+                proof_ints.append(20 * cur_int + ord(character) - 65)  # ord('A') = 65
                 cur_int = 0
-            else:  # 'U' <= ch <= 'Y'
-                cur_int = 5 * cur_int + ord(ch) - 84  # ord('U') = 85
+            else:  # 'U' <= character <= 'Y'
+                cur_int = 5 * cur_int + ord(character) - 84  # ord('U') = 85
         vprint(5, 'Integer-coded steps:', proof_ints)
-        # Processing of the proof
+
+        return self.process_proof(proof_ints, plabels, label_end)
+
+    def process_proof(self, proof_ints, plabels, label_end) -> list[Stmt]:
+        """Processing of the proof"""
         stack: list[Stmt] = []  # proof stack
         # statements saved for later reuse (marked with a 'Z')
         saved_stmts = []
@@ -571,13 +615,11 @@ class MM:
             elif proof_int < label_end:
                 # proof_int denotes an implicit hypothesis or a label in the
                 # label bloc
-                self.treat_step(self.labels[plabels[proof_int] or ''], stack)
+                self.treat_step(self.labels[plabels[proof_int]], stack)
             elif proof_int >= label_end + n_saved_stmts:
-                MMError(
-                    ("Not enough saved proof steps ({} saved but calling " +
-                    "the {}th).").format(
-                        n_saved_stmts,
-                        proof_int))
+                raise MMError(
+                    f"Not enough saved proof steps ({n_saved_stmts} saved but calling " +
+                    f"the {proof_int}th).")
             else:  # label_end <= proof_int < label_end + n_saved_stmts
                 # proof_int denotes an earlier proof step marked with a 'Z'
                 # A proof step that has already been proved can be treated as
@@ -586,7 +628,7 @@ class MM:
                 vprint(15, 'Reusing step', stmt)
                 self.treat_step(
                     ('$a',
-                     (set(), [], [], stmt)),
+                     Assertion(set(), [], [], stmt)),
                     stack)
         return stack
 
@@ -613,12 +655,10 @@ class MM:
         if len(stack) > 1:
             raise MMError(
                 "Stack has more than one entry at end of proof (top " +
-                "entry: {} ; proved assertion: {}).".format(
-                    stack[0],
-                    conclusion))
+                f"entry: {stack[0]} ; proved assertion: {conclusion}).")
         if stack[0] != conclusion:
-            raise MMError(("Stack entry {} does not match proved " +
-                          " assertion {}.").format(stack[0], conclusion))
+            raise MMError(f"Stack entry {stack[0]} does not match proved " +
+                          f" assertion {conclusion}.")
         vprint(3, 'Correct proof!')
 
     def dump(self) -> None:
@@ -626,8 +666,8 @@ class MM:
         print(self.labels)
 
 
-if __name__ == '__main__':
-    """Parse the arguments and verify the given Metamath database."""
+def parse_args():
+    """Parse the arguments."""
     parser = argparse.ArgumentParser(description="""Verify a Metamath database.
       The grammar of the whole file is verified.  Proofs are verified between
       the statements with labels BEGIN_LABEL (included) and STOP_LABEL (not
@@ -678,13 +718,20 @@ if __name__ == '__main__':
         dest='stop_label',
         type=str,
         help='label where to stop verifying proofs (not included)')
-    args = parser.parse_args()
-    verbosity = args.verbosity
-    db_file = args.database
-    logfile = args.logfile
+    return parser.parse_args()
+
+def run(db_file, begin_label, stop_label):
+    """Verify the given Metamath database."""
     vprint(1, 'mmverify.py -- Proof verifier for the Metamath language')
-    mm = MM(args.begin_label, args.stop_label)
-    vprint(1, 'Reading source file "{}"...'.format(db_file.name))
-    mm.read(Toks(db_file))
+    metamath = MM(begin_label, stop_label)
+    vprint(1, f'Reading source file "{db_file.name}"...')
+    metamath.read(Toks(db_file))
     vprint(1, 'No errors were found.')
-    # mm.dump()
+    # metamath.dump()
+
+if __name__ == '__main__':
+    args = parse_args()
+    verbosity = args.verbosity
+    logfile = args.logfile
+
+    run(args.database, args.begin_label, args.stop_label)
